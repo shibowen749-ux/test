@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""抓取近一年人民币中间价并输出币种间换算汇率二维表。"""
+"""抓取近一年人民币参考汇率并输出币种间换算汇率二维表。"""
 
 from __future__ import annotations
 
@@ -7,26 +7,32 @@ import argparse
 import csv
 import datetime as dt
 import json
-import math
-import re
 import sys
 import time
 import urllib.parse
 import urllib.request
 from typing import Dict, Iterable, List, Optional, Tuple
 
-DEFAULT_URL = "https://www.chinamoney.com.cn/ags/ms/cm-u-bk-ccpr/CcprHisNew"
-PAIR_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)?\s*([A-Za-z]{3})\s*/\s*([A-Za-z]{3})\s*$")
+# 新数据源：Frankfurter（基于 ECB 公布汇率，免费且无需鉴权）
+# 文档：https://www.frankfurter.app/docs/
+DEFAULT_URL = "https://api.frankfurter.app"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="抓取近1年人民币中间价，并输出各币种之间的换算汇率（CSV二维表）。"
+        description=(
+            "抓取近1年人民币参考汇率，并输出各币种之间的换算汇率（CSV二维表）。"
+        )
     )
     parser.add_argument("--start-date", help="开始日期，格式 YYYY-MM-DD；默认今天往前1年")
     parser.add_argument("--end-date", help="结束日期，格式 YYYY-MM-DD；默认今天")
-    parser.add_argument("--url", default=DEFAULT_URL, help="中间价数据接口地址")
-    parser.add_argument("--sleep", type=float, default=0.2, help="按天抓取时每次请求间隔秒数")
+    parser.add_argument("--url", default=DEFAULT_URL, help="汇率接口基础地址")
+    parser.add_argument(
+        "--symbols",
+        default="",
+        help="可选：指定币种列表（逗号分隔，如 USD,EUR,JPY）；为空则使用接口返回的全部币种",
+    )
+    parser.add_argument("--sleep", type=float, default=0.0, help="请求间隔秒数")
     parser.add_argument(
         "--output",
         default="cross_rates.csv",
@@ -40,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--raw-output",
         default="raw_middle_rates.csv",
-        help="输出原始中间价CSV路径（列：date,pair,value）",
+        help="输出原始参考汇率CSV路径（列：date,base_currency,currency,rate）",
     )
     return parser.parse_args()
 
@@ -61,160 +67,78 @@ def http_get_json(url: str, params: Dict[str, str]) -> dict:
     req = urllib.request.Request(
         full_url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; RMBMiddleRateBot/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; RMBFxCrawler/1.0)",
             "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.chinamoney.com.cn/",
         },
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = resp.read()
-    for enc in ("utf-8", "gbk"):
-        try:
-            return json.loads(data.decode(enc))
-        except Exception:
-            continue
-    return json.loads(data.decode("utf-8", errors="ignore"))
+    return json.loads(data.decode("utf-8"))
 
 
-def collect_record_list(payload: object) -> List[dict]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if not isinstance(payload, dict):
-        return []
+def fetch_daily_rates(
+    base_url: str,
+    start: dt.date,
+    end: dt.date,
+    symbols: List[str],
+    sleep_s: float,
+) -> Dict[str, Dict[str, float]]:
+    """
+    返回结构：
+    {
+      '2025-01-01': {'CNY':1.0, 'USD':..., 'EUR':...},
+      ...
+    }
+    其中每个值均表示：1 单位币种 = ? CNY
+    """
 
-    common_keys = ("records", "data", "result", "items", "list")
-    for k in common_keys:
-        v = payload.get(k)
-        if isinstance(v, list):
-            return [item for item in v if isinstance(item, dict)]
-        if isinstance(v, dict):
-            for kk in common_keys:
-                vv = v.get(kk)
-                if isinstance(vv, list):
-                    return [item for item in vv if isinstance(item, dict)]
+    day_currency_to_cny: Dict[str, Dict[str, float]] = {}
+    symbols_q = ",".join(symbols) if symbols else ""
 
-    for v in payload.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return [item for item in v if isinstance(item, dict)]
-    return []
-
-
-def try_parse_float(x: object) -> Optional[float]:
-    if x is None:
-        return None
-    s = str(x).strip().replace(",", "")
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def extract_date(record: dict) -> Optional[str]:
-    for key in ("date", "tradeDate", "valueDate", "pubDate"):
-        if key in record and str(record[key]).strip():
-            value = str(record[key]).strip()
-            value = value[:10]
-            try:
-                parse_date(value)
-                return value
-            except ValueError:
-                continue
-    return None
-
-
-def extract_pair(record: dict) -> Optional[str]:
-    for key in ("ccyPair", "pair", "currencyPair", "ccy", "symbol", "name"):
-        if key in record:
-            pair = str(record[key]).strip().upper().replace("-", "/")
-            if "/" in pair:
-                return pair
-    return None
-
-
-def extract_value(record: dict) -> Optional[float]:
-    for key in ("middlePrice", "price", "value", "mid", "rate"):
-        if key in record:
-            f = try_parse_float(record[key])
-            if f is not None:
-                return f
-    for v in record.values():
-        f = try_parse_float(v)
-        if f is not None and f > 0:
-            return f
-    return None
-
-
-def parse_pair(pair: str) -> Optional[Tuple[str, str, float]]:
-    m = PAIR_RE.match(pair)
-    if not m:
-        return None
-    unit = float(m.group(1)) if m.group(1) else 1.0
-    c1 = m.group(2)
-    c2 = m.group(3)
-    return c1, c2, unit
-
-
-def to_cny_per_currency(pair: str, value: float) -> Optional[Tuple[str, float]]:
-    parsed = parse_pair(pair)
-    if not parsed:
-        return None
-    left, right, unit = parsed
-    if value <= 0 or unit <= 0:
-        return None
-
-    if right == "CNY":
-        # unit left = value CNY
-        return left, value / unit
-    if left == "CNY":
-        # unit CNY = value right  => 1 right = unit/value CNY
-        return right, unit / value
-    return None
-
-
-def fetch_by_day(url: str, start: dt.date, end: dt.date, sleep_s: float) -> List[dict]:
-    records: List[dict] = []
     for d in daterange(start, end):
         day = d.strftime("%Y-%m-%d")
-        params = {
-            "lang": "cn",
-            "startDate": day,
-            "endDate": day,
-            "pageSize": "2000",
-            "pageNum": "1",
-        }
+        url = f"{base_url.rstrip('/')}/{day}"
+        params = {"from": "CNY"}
+        if symbols_q:
+            params["to"] = symbols_q
+
         try:
             payload = http_get_json(url, params)
-            batch = collect_record_list(payload)
-            records.extend(batch)
+            # 期望结构：{"amount":1.0,"base":"CNY","date":"YYYY-MM-DD","rates":{"USD":...}}
+            rates = payload.get("rates", {})
+            if not isinstance(rates, dict):
+                rates = {}
+
+            ccy_map: Dict[str, float] = {"CNY": 1.0}
+            # Frankfurter 返回的是 1 CNY = x TARGET；我们需要 1 TARGET = ? CNY
+            for ccy, val in rates.items():
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if v <= 0:
+                    continue
+                ccy_map[ccy.upper()] = 1.0 / v
+
+            if len(ccy_map) > 1:
+                day_currency_to_cny[day] = ccy_map
         except Exception as exc:
             print(f"[WARN] {day} 抓取失败: {exc}", file=sys.stderr)
-        time.sleep(max(sleep_s, 0))
-    return records
+
+        time.sleep(max(sleep_s, 0.0))
+
+    return day_currency_to_cny
 
 
-def normalize(records: List[dict]) -> Tuple[List[Tuple[str, str, float]], Dict[str, Dict[str, float]]]:
-    raw_rows: List[Tuple[str, str, float]] = []
-    day_currency_to_cny: Dict[str, Dict[str, float]] = {}
-
-    for record in records:
-        date = extract_date(record)
-        pair = extract_pair(record)
-        value = extract_value(record)
-        if not date or not pair or value is None:
-            continue
-        raw_rows.append((date, pair, value))
-
-        converted = to_cny_per_currency(pair, value)
-        if not converted:
-            continue
-        ccy, cny_per_unit = converted
-
-        day_map = day_currency_to_cny.setdefault(date, {"CNY": 1.0})
-        day_map[ccy] = cny_per_unit
-
-    return raw_rows, day_currency_to_cny
+def build_raw_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
+    rows: List[Tuple[str, str, str, float]] = []
+    for day in sorted(day_currency_to_cny.keys()):
+        ccy_map = day_currency_to_cny[day]
+        for ccy in sorted(ccy_map.keys()):
+            if ccy == "CNY":
+                continue
+            rows.append((day, "CNY", ccy, 1.0 / ccy_map[ccy]))
+    return rows
 
 
 def build_cross_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
@@ -225,16 +149,16 @@ def build_cross_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[T
         for src in currencies:
             for dst in currencies:
                 rate = cny_map[src] / cny_map[dst]
-                if math.isfinite(rate):
-                    rows.append((date, src, dst, rate))
+                rows.append((date, src, dst, rate))
     return rows
 
 
-def write_raw_csv(path: str, rows: List[Tuple[str, str, float]]) -> None:
+def write_raw_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["date", "pair", "value"])
-        w.writerows(rows)
+        w.writerow(["date", "base_currency", "currency", "rate"])
+        for date, base, ccy, rate in rows:
+            w.writerow([date, base, ccy, f"{rate:.10f}"])
 
 
 def write_cross_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
@@ -267,23 +191,23 @@ def main() -> int:
     args = parse_args()
     end = parse_date(args.end_date) if args.end_date else dt.date.today()
     start = parse_date(args.start_date) if args.start_date else (end - dt.timedelta(days=365))
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     if start > end:
         print("[ERROR] start-date 不能晚于 end-date", file=sys.stderr)
         return 1
 
     print(f"抓取区间: {start} ~ {end}")
-    records = fetch_by_day(args.url, start, end, args.sleep)
-    print(f"抓取到原始记录数: {len(records)}")
+    day_currency_to_cny = fetch_daily_rates(args.url, start, end, symbols, args.sleep)
 
-    raw_rows, day_currency_to_cny = normalize(records)
+    raw_rows = build_raw_rows(day_currency_to_cny)
     cross_rows = build_cross_rows(day_currency_to_cny)
 
     write_raw_csv(args.raw_output, raw_rows)
     write_cross_csv(args.output, cross_rows)
     latest = write_latest_matrix_csv(args.latest_matrix_output, day_currency_to_cny)
 
-    print(f"已写出原始中间价: {args.raw_output} ({len(raw_rows)} 行)")
+    print(f"已写出原始参考汇率: {args.raw_output} ({len(raw_rows)} 行)")
     print(f"已写出换算汇率: {args.output} ({len(cross_rows)} 行)")
     if latest:
         print(f"已写出最新交易日二维矩阵: {args.latest_matrix_output} (date={latest})")
