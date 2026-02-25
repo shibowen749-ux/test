@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""抓取近一年人民币参考汇率并输出币种间换算汇率二维表。"""
+"""抓取人民币参考汇率并输出币种间换算汇率二维表。"""
 
 from __future__ import annotations
 
@@ -13,19 +13,26 @@ import urllib.parse
 import urllib.request
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# 新数据源：Frankfurter（基于 ECB 公布汇率，免费且无需鉴权）
-# 文档：https://www.frankfurter.app/docs/
 DEFAULT_URL = "https://api.frankfurter.app"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "抓取近1年人民币参考汇率，并输出各币种之间的换算汇率（CSV二维表）。"
-        )
+        description="抓取人民币参考汇率，并输出各币种之间的换算汇率（CSV二维表）。"
     )
-    parser.add_argument("--start-date", help="开始日期，格式 YYYY-MM-DD；默认今天往前1年")
-    parser.add_argument("--end-date", help="结束日期，格式 YYYY-MM-DD；默认今天")
+    parser.add_argument(
+        "--range",
+        dest="date_range",
+        help="数据区间（必填推荐），格式 START:END，如 2025-01-01:2025-12-31",
+    )
+    parser.add_argument("--start-date", help="开始日期，格式 YYYY-MM-DD（与 --range 二选一）")
+    parser.add_argument("--end-date", help="结束日期，格式 YYYY-MM-DD（与 --range 二选一）")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=365,
+        help="当未提供 --range 且未同时提供 start/end 时，默认回溯天数（默认 365）",
+    )
     parser.add_argument("--url", default=DEFAULT_URL, help="汇率接口基础地址")
     parser.add_argument(
         "--symbols",
@@ -53,6 +60,30 @@ def parse_args() -> argparse.Namespace:
 
 def parse_date(date_str: str) -> dt.date:
     return dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+
+
+def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
+    if args.date_range:
+        if args.start_date or args.end_date:
+            raise ValueError("使用 --range 时，不应再传 --start-date/--end-date")
+        if ":" not in args.date_range:
+            raise ValueError("--range 格式错误，应为 START:END")
+        start_s, end_s = [x.strip() for x in args.date_range.split(":", 1)]
+        start = parse_date(start_s)
+        end = parse_date(end_s)
+        return start, end
+
+    if bool(args.start_date) ^ bool(args.end_date):
+        raise ValueError("--start-date 与 --end-date 需要同时提供")
+
+    if args.start_date and args.end_date:
+        return parse_date(args.start_date), parse_date(args.end_date)
+
+    if args.days < 1:
+        raise ValueError("--days 必须 >= 1")
+    end = dt.date.today()
+    start = end - dt.timedelta(days=args.days)
+    return start, end
 
 
 def daterange(start: dt.date, end: dt.date) -> Iterable[dt.date]:
@@ -83,15 +114,6 @@ def fetch_daily_rates(
     symbols: List[str],
     sleep_s: float,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    返回结构：
-    {
-      '2025-01-01': {'CNY':1.0, 'USD':..., 'EUR':...},
-      ...
-    }
-    其中每个值均表示：1 单位币种 = ? CNY
-    """
-
     day_currency_to_cny: Dict[str, Dict[str, float]] = {}
     symbols_q = ",".join(symbols) if symbols else ""
 
@@ -104,13 +126,11 @@ def fetch_daily_rates(
 
         try:
             payload = http_get_json(url, params)
-            # 期望结构：{"amount":1.0,"base":"CNY","date":"YYYY-MM-DD","rates":{"USD":...}}
             rates = payload.get("rates", {})
             if not isinstance(rates, dict):
                 rates = {}
 
             ccy_map: Dict[str, float] = {"CNY": 1.0}
-            # Frankfurter 返回的是 1 CNY = x TARGET；我们需要 1 TARGET = ? CNY
             for ccy, val in rates.items():
                 try:
                     v = float(val)
@@ -148,8 +168,7 @@ def build_cross_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[T
         currencies = sorted(cny_map.keys())
         for src in currencies:
             for dst in currencies:
-                rate = cny_map[src] / cny_map[dst]
-                rows.append((date, src, dst, rate))
+                rows.append((date, src, dst, cny_map[src] / cny_map[dst]))
     return rows
 
 
@@ -189,8 +208,12 @@ def write_latest_matrix_csv(path: str, day_currency_to_cny: Dict[str, Dict[str, 
 
 def main() -> int:
     args = parse_args()
-    end = parse_date(args.end_date) if args.end_date else dt.date.today()
-    start = parse_date(args.start_date) if args.start_date else (end - dt.timedelta(days=365))
+    try:
+        start, end = resolve_date_window(args)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     if start > end:

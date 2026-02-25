@@ -1,28 +1,41 @@
 # 人民币汇率爬虫（已更换数据源）
 
-该项目提供脚本 `rmb_middle_rate_crawler.py`，用于抓取近 1 年每日人民币参考汇率，并输出币种间换算汇率。
+该项目提供脚本 `rmb_middle_rate_crawler.py`，用于抓取人民币参考汇率，并输出币种间换算汇率。
 
 > 说明：原 `chinamoney` 源在部分环境会出现 403，本版本已切换到 `Frankfurter API`（免费、无需鉴权、稳定可用）。
 
 ## 功能
 
-- 按日期区间抓取人民币参考汇率（默认：今天往前 365 天）。
-- 产出原始汇率数据（`1 CNY = x 目标币种`）。
-- 基于 CNY 枢轴，换算各币种两两汇率。
-- 输出最新交易日的二维矩阵表格（行列均为币种）。
+- 支持自定义数据区间（`--range START:END`）。
+- 兼容 `--start-date + --end-date` 方式。
+- 若未提供区间，可通过 `--days` 指定回溯天数（默认 365）。
+- 产出原始汇率、两两换算汇率、最新交易日二维矩阵。
 
 ## 运行方式
 
+### 1) 推荐：直接指定数据区间
+
 ```bash
-python3 rmb_middle_rate_crawler.py
+python3 rmb_middle_rate_crawler.py --range 2025-01-01:2025-12-31
 ```
 
-可选参数示例：
+### 2) 兼容：使用开始/结束日期
+
+```bash
+python3 rmb_middle_rate_crawler.py --start-date 2025-01-01 --end-date 2025-12-31
+```
+
+### 3) 不指定区间：按回溯天数
+
+```bash
+python3 rmb_middle_rate_crawler.py --days 180
+```
+
+### 带币种筛选示例
 
 ```bash
 python3 rmb_middle_rate_crawler.py \
-  --start-date 2025-01-01 \
-  --end-date 2025-12-31 \
+  --range 2025-01-01:2025-12-31 \
   --symbols USD,EUR,JPY,HKD,GBP \
   --output cross_rates.csv \
   --latest-matrix-output latest_matrix.csv \
