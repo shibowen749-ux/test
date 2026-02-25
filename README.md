@@ -7,6 +7,7 @@
 ## 功能
 
 - 支持自定义数据区间（`--range START:END`）。
+- 优先使用区间接口一次性抓取，减少逐日请求导致的卡顿。
 - 兼容 `--start-date + --end-date` 方式。
 - 若未提供区间，可通过 `--days` 指定回溯天数（默认 365）。
 - 产出原始汇率、两两换算汇率、最新交易日二维矩阵。
@@ -37,6 +38,7 @@ python3 rmb_middle_rate_crawler.py --days 180
 python3 rmb_middle_rate_crawler.py \
   --range 2025-01-01:2025-12-31 \
   --symbols USD,EUR,JPY,HKD,GBP \
+  --timeout 8 \
   --output cross_rates.csv \
   --latest-matrix-output latest_matrix.csv \
   --raw-output raw_middle_rates.csv
@@ -57,4 +59,5 @@ python3 rmb_middle_rate_crawler.py \
 ## 说明
 
 - 脚本按天请求，遇到个别日期失败会输出警告并继续。
+- 默认会先尝试区间接口（单请求），失败后自动回退逐日抓取（多请求）。
 - 若不指定 `--symbols`，默认使用接口返回的全部可用币种。

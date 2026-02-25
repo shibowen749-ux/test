@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
         help="当未提供 --range 且未同时提供 start/end 时，默认回溯天数（默认 365）",
     )
     parser.add_argument("--url", default=DEFAULT_URL, help="汇率接口基础地址")
+    parser.add_argument("--timeout", type=float, default=8.0, help="单次HTTP请求超时秒数（默认8秒）")
     parser.add_argument(
         "--symbols",
         default="",
@@ -93,7 +94,7 @@ def daterange(start: dt.date, end: dt.date) -> Iterable[dt.date]:
         d += dt.timedelta(days=1)
 
 
-def http_get_json(url: str, params: Dict[str, str]) -> dict:
+def http_get_json(url: str, params: Dict[str, str], timeout: float) -> dict:
     full_url = f"{url}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(
         full_url,
@@ -102,9 +103,53 @@ def http_get_json(url: str, params: Dict[str, str]) -> dict:
             "Accept": "application/json,text/plain,*/*",
         },
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
     return json.loads(data.decode("utf-8"))
+
+
+def normalize_rates(rates: object) -> Dict[str, float]:
+    normalized: Dict[str, float] = {"CNY": 1.0}
+    if not isinstance(rates, dict):
+        return normalized
+
+    for ccy, val in rates.items():
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        normalized[str(ccy).upper()] = 1.0 / v
+    return normalized
+
+
+def fetch_range_rates(
+    base_url: str,
+    start: dt.date,
+    end: dt.date,
+    symbols: List[str],
+    timeout: float,
+) -> Dict[str, Dict[str, float]]:
+    """优先使用区间接口一次性抓取，避免逐日请求导致卡顿。"""
+    symbols_q = ",".join(symbols) if symbols else ""
+    day_currency_to_cny: Dict[str, Dict[str, float]] = {}
+
+    url = f"{base_url.rstrip('/')}/{start:%Y-%m-%d}..{end:%Y-%m-%d}"
+    params = {"from": "CNY"}
+    if symbols_q:
+        params["to"] = symbols_q
+
+    payload = http_get_json(url, params, timeout=timeout)
+    rates_by_day = payload.get("rates", {}) if isinstance(payload, dict) else {}
+    if not isinstance(rates_by_day, dict):
+        return {}
+
+    for day, rates in rates_by_day.items():
+        ccy_map = normalize_rates(rates)
+        if len(ccy_map) > 1:
+            day_currency_to_cny[str(day)] = ccy_map
+    return day_currency_to_cny
 
 
 def fetch_daily_rates(
@@ -113,6 +158,7 @@ def fetch_daily_rates(
     end: dt.date,
     symbols: List[str],
     sleep_s: float,
+    timeout: float,
 ) -> Dict[str, Dict[str, float]]:
     day_currency_to_cny: Dict[str, Dict[str, float]] = {}
     symbols_q = ",".join(symbols) if symbols else ""
@@ -125,20 +171,8 @@ def fetch_daily_rates(
             params["to"] = symbols_q
 
         try:
-            payload = http_get_json(url, params)
-            rates = payload.get("rates", {})
-            if not isinstance(rates, dict):
-                rates = {}
-
-            ccy_map: Dict[str, float] = {"CNY": 1.0}
-            for ccy, val in rates.items():
-                try:
-                    v = float(val)
-                except (TypeError, ValueError):
-                    continue
-                if v <= 0:
-                    continue
-                ccy_map[ccy.upper()] = 1.0 / v
+            payload = http_get_json(url, params, timeout=timeout)
+            ccy_map = normalize_rates(payload.get("rates", {}))
 
             if len(ccy_map) > 1:
                 day_currency_to_cny[day] = ccy_map
@@ -221,7 +255,19 @@ def main() -> int:
         return 1
 
     print(f"抓取区间: {start} ~ {end}")
-    day_currency_to_cny = fetch_daily_rates(args.url, start, end, symbols, args.sleep)
+    try:
+        day_currency_to_cny = fetch_range_rates(args.url, start, end, symbols, timeout=args.timeout)
+        print(f"已使用区间接口一次性抓取，共 {len(day_currency_to_cny)} 天数据")
+    except Exception as exc:
+        print(f"[WARN] 区间接口抓取失败，回退逐日抓取: {exc}", file=sys.stderr)
+        day_currency_to_cny = fetch_daily_rates(
+            args.url,
+            start,
+            end,
+            symbols,
+            args.sleep,
+            timeout=args.timeout,
+        )
 
     raw_rows = build_raw_rows(day_currency_to_cny)
     cross_rows = build_cross_rows(day_currency_to_cny)
