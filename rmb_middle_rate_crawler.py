@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""抓取人民币参考汇率并输出币种间换算汇率二维表。"""
+"""抓取人民币参考汇率并输出人民币兑其他币种的一维表。"""
 
 from __future__ import annotations
 
@@ -11,19 +11,19 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 DEFAULT_URL = "https://api.frankfurter.app"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="抓取人民币参考汇率，并输出各币种之间的换算汇率（CSV二维表）。"
+        description="抓取人民币参考汇率，并输出人民币兑其他币种的一维表（CSV）。"
     )
     parser.add_argument(
         "--range",
         dest="date_range",
-        help="数据区间（必填推荐），格式 START:END，如 2025-01-01:2025-12-31",
+        help="数据区间（推荐），格式 START:END，如 2025-01-01:2025-12-31",
     )
     parser.add_argument("--start-date", help="开始日期，格式 YYYY-MM-DD（与 --range 二选一）")
     parser.add_argument("--end-date", help="结束日期，格式 YYYY-MM-DD（与 --range 二选一）")
@@ -40,21 +40,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="可选：指定币种列表（逗号分隔，如 USD,EUR,JPY）；为空则使用接口返回的全部币种",
     )
-    parser.add_argument("--sleep", type=float, default=0.0, help="请求间隔秒数")
+    parser.add_argument("--sleep", type=float, default=0.0, help="逐日回退抓取时请求间隔秒数")
     parser.add_argument(
         "--output",
-        default="cross_rates.csv",
+        default="rmb_rates.csv",
         help="输出CSV文件路径（列：date,from_currency,to_currency,rate）",
-    )
-    parser.add_argument(
-        "--latest-matrix-output",
-        default="latest_matrix.csv",
-        help="输出最新交易日矩阵CSV（二维表）路径",
-    )
-    parser.add_argument(
-        "--raw-output",
-        default="raw_middle_rates.csv",
-        help="输出原始参考汇率CSV路径（列：date,base_currency,currency,rate）",
     )
     return parser.parse_args()
 
@@ -70,9 +60,7 @@ def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
         if ":" not in args.date_range:
             raise ValueError("--range 格式错误，应为 START:END")
         start_s, end_s = [x.strip() for x in args.date_range.split(":", 1)]
-        start = parse_date(start_s)
-        end = parse_date(end_s)
-        return start, end
+        return parse_date(start_s), parse_date(end_s)
 
     if bool(args.start_date) ^ bool(args.end_date):
         raise ValueError("--start-date 与 --end-date 需要同时提供")
@@ -108,8 +96,9 @@ def http_get_json(url: str, params: Dict[str, str], timeout: float) -> dict:
     return json.loads(data.decode("utf-8"))
 
 
-def normalize_rates(rates: object) -> Dict[str, float]:
-    normalized: Dict[str, float] = {"CNY": 1.0}
+def normalize_cny_to_targets(rates: object) -> Dict[str, float]:
+    """将接口返回归一化为: 1 CNY = x TARGET。"""
+    normalized: Dict[str, float] = {}
     if not isinstance(rates, dict):
         return normalized
 
@@ -120,7 +109,7 @@ def normalize_rates(rates: object) -> Dict[str, float]:
             continue
         if v <= 0:
             continue
-        normalized[str(ccy).upper()] = 1.0 / v
+        normalized[str(ccy).upper()] = v
     return normalized
 
 
@@ -131,9 +120,9 @@ def fetch_range_rates(
     symbols: List[str],
     timeout: float,
 ) -> Dict[str, Dict[str, float]]:
-    """优先使用区间接口一次性抓取，避免逐日请求导致卡顿。"""
+    """优先使用区间接口一次性抓取，返回 date -> {TARGET: rate(CNY->TARGET)}。"""
     symbols_q = ",".join(symbols) if symbols else ""
-    day_currency_to_cny: Dict[str, Dict[str, float]] = {}
+    day_to_rates: Dict[str, Dict[str, float]] = {}
 
     url = f"{base_url.rstrip('/')}/{start:%Y-%m-%d}..{end:%Y-%m-%d}"
     params = {"from": "CNY"}
@@ -146,10 +135,10 @@ def fetch_range_rates(
         return {}
 
     for day, rates in rates_by_day.items():
-        ccy_map = normalize_rates(rates)
-        if len(ccy_map) > 1:
-            day_currency_to_cny[str(day)] = ccy_map
-    return day_currency_to_cny
+        normalized = normalize_cny_to_targets(rates)
+        if normalized:
+            day_to_rates[str(day)] = normalized
+    return day_to_rates
 
 
 def fetch_daily_rates(
@@ -160,7 +149,7 @@ def fetch_daily_rates(
     sleep_s: float,
     timeout: float,
 ) -> Dict[str, Dict[str, float]]:
-    day_currency_to_cny: Dict[str, Dict[str, float]] = {}
+    day_to_rates: Dict[str, Dict[str, float]] = {}
     symbols_q = ",".join(symbols) if symbols else ""
 
     for d in daterange(start, end):
@@ -172,72 +161,32 @@ def fetch_daily_rates(
 
         try:
             payload = http_get_json(url, params, timeout=timeout)
-            ccy_map = normalize_rates(payload.get("rates", {}))
-
-            if len(ccy_map) > 1:
-                day_currency_to_cny[day] = ccy_map
+            normalized = normalize_cny_to_targets(payload.get("rates", {}))
+            if normalized:
+                day_to_rates[day] = normalized
         except Exception as exc:
             print(f"[WARN] {day} 抓取失败: {exc}", file=sys.stderr)
 
         time.sleep(max(sleep_s, 0.0))
 
-    return day_currency_to_cny
+    return day_to_rates
 
 
-def build_raw_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
+def build_rmb_rows(day_to_rates: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
     rows: List[Tuple[str, str, str, float]] = []
-    for day in sorted(day_currency_to_cny.keys()):
-        ccy_map = day_currency_to_cny[day]
-        for ccy in sorted(ccy_map.keys()):
-            if ccy == "CNY":
-                continue
-            rows.append((day, "CNY", ccy, 1.0 / ccy_map[ccy]))
+    for day in sorted(day_to_rates.keys()):
+        rates = day_to_rates[day]
+        for ccy in sorted(rates.keys()):
+            rows.append((day, "CNY", ccy, rates[ccy]))
     return rows
 
 
-def build_cross_rows(day_currency_to_cny: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
-    rows: List[Tuple[str, str, str, float]] = []
-    for date in sorted(day_currency_to_cny.keys()):
-        cny_map = day_currency_to_cny[date]
-        currencies = sorted(cny_map.keys())
-        for src in currencies:
-            for dst in currencies:
-                rows.append((date, src, dst, cny_map[src] / cny_map[dst]))
-    return rows
-
-
-def write_raw_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["date", "base_currency", "currency", "rate"])
-        for date, base, ccy, rate in rows:
-            w.writerow([date, base, ccy, f"{rate:.10f}"])
-
-
-def write_cross_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
+def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["date", "from_currency", "to_currency", "rate"])
         for date, src, dst, rate in rows:
             w.writerow([date, src, dst, f"{rate:.10f}"])
-
-
-def write_latest_matrix_csv(path: str, day_currency_to_cny: Dict[str, Dict[str, float]]) -> Optional[str]:
-    if not day_currency_to_cny:
-        return None
-    latest = sorted(day_currency_to_cny.keys())[-1]
-    cny_map = day_currency_to_cny[latest]
-    currencies = sorted(cny_map.keys())
-
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow([latest] + currencies)
-        for src in currencies:
-            row = [src]
-            for dst in currencies:
-                row.append(f"{(cny_map[src] / cny_map[dst]):.10f}")
-            w.writerow(row)
-    return latest
 
 
 def main() -> int:
@@ -248,19 +197,19 @@ def main() -> int:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-
     if start > end:
         print("[ERROR] start-date 不能晚于 end-date", file=sys.stderr)
         return 1
 
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
     print(f"抓取区间: {start} ~ {end}")
     try:
-        day_currency_to_cny = fetch_range_rates(args.url, start, end, symbols, timeout=args.timeout)
-        print(f"已使用区间接口一次性抓取，共 {len(day_currency_to_cny)} 天数据")
+        day_to_rates = fetch_range_rates(args.url, start, end, symbols, timeout=args.timeout)
+        print(f"已使用区间接口一次性抓取，共 {len(day_to_rates)} 天数据")
     except Exception as exc:
         print(f"[WARN] 区间接口抓取失败，回退逐日抓取: {exc}", file=sys.stderr)
-        day_currency_to_cny = fetch_daily_rates(
+        day_to_rates = fetch_daily_rates(
             args.url,
             start,
             end,
@@ -269,20 +218,9 @@ def main() -> int:
             timeout=args.timeout,
         )
 
-    raw_rows = build_raw_rows(day_currency_to_cny)
-    cross_rows = build_cross_rows(day_currency_to_cny)
-
-    write_raw_csv(args.raw_output, raw_rows)
-    write_cross_csv(args.output, cross_rows)
-    latest = write_latest_matrix_csv(args.latest_matrix_output, day_currency_to_cny)
-
-    print(f"已写出原始参考汇率: {args.raw_output} ({len(raw_rows)} 行)")
-    print(f"已写出换算汇率: {args.output} ({len(cross_rows)} 行)")
-    if latest:
-        print(f"已写出最新交易日二维矩阵: {args.latest_matrix_output} (date={latest})")
-    else:
-        print("[WARN] 未生成最新交易日矩阵（可能没有可解析的数据）")
-
+    rows = build_rmb_rows(day_to_rates)
+    write_rmb_csv(args.output, rows)
+    print(f"已写出人民币一维汇率表: {args.output} ({len(rows)} 行)")
     return 0
 
 

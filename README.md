@@ -1,16 +1,15 @@
-# 人民币汇率爬虫（已更换数据源）
+# 人民币汇率爬虫（一维表输出）
 
-该项目提供脚本 `rmb_middle_rate_crawler.py`，用于抓取人民币参考汇率，并输出币种间换算汇率。
+该项目提供脚本 `rmb_middle_rate_crawler.py`，用于抓取人民币参考汇率，并输出“人民币兑其他币种”的一维表。
 
-> 说明：原 `chinamoney` 源在部分环境会出现 403，本版本已切换到 `Frankfurter API`（免费、无需鉴权、稳定可用）。
+## 输出格式（已调整）
 
-## 功能
+输出文件默认为 `rmb_rates.csv`，列为：
 
-- 支持自定义数据区间（`--range START:END`）。
-- 优先使用区间接口一次性抓取，减少逐日请求导致的卡顿。
-- 兼容 `--start-date + --end-date` 方式。
-- 若未提供区间，可通过 `--days` 指定回溯天数（默认 365）。
-- 产出原始汇率、两两换算汇率、最新交易日二维矩阵。
+- `date`
+- `from_currency`（固定为 `CNY`）
+- `to_currency`
+- `rate`（表示 `1 CNY = rate to_currency`）
 
 ## 运行方式
 
@@ -39,25 +38,17 @@ python3 rmb_middle_rate_crawler.py \
   --range 2025-01-01:2025-12-31 \
   --symbols USD,EUR,JPY,HKD,GBP \
   --timeout 8 \
-  --output cross_rates.csv \
-  --latest-matrix-output latest_matrix.csv \
-  --raw-output raw_middle_rates.csv
+  --output rmb_rates.csv
 ```
-
-## 输出文件
-
-- `raw_middle_rates.csv`：原始参考汇率，列为 `date,base_currency,currency,rate`
-- `cross_rates.csv`：换算汇率，列为 `date,from_currency,to_currency,rate`
-- `latest_matrix.csv`：最新交易日二维矩阵（首行为日期 + 列币种，首列为行币种）
 
 ## 数据源
 
 - 默认源：`https://api.frankfurter.app`
 - 请求方式：`/{date}?from=CNY&to=...`
-- 可通过 `--url` 覆盖为兼容接口
+- 优先尝试区间接口：`/START..END?from=CNY&to=...`
+- 区间接口失败时自动回退逐日抓取
 
 ## 说明
 
-- 脚本按天请求，遇到个别日期失败会输出警告并继续。
-- 默认会先尝试区间接口（单请求），失败后自动回退逐日抓取（多请求）。
+- 脚本会输出人民币兑各币种汇率的一维表，不再输出币种两两换算矩阵。
 - 若不指定 `--symbols`，默认使用接口返回的全部可用币种。
