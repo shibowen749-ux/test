@@ -1,51 +1,85 @@
 #!/usr/bin/env python3
-"""抓取人民币参考汇率并输出人民币兑其他币种的一维表。"""
+"""抓取 SAFE 人民币汇率中间价并输出人民币兑其他币种的一维表。"""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
-import json
+import html
+import re
 import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
-DEFAULT_URL = "https://api.frankfurter.app"
+SOURCE_PAGE_URL = "https://www.safe.gov.cn/safe/rmbhlzjj/index.html"
+DEFAULT_QUERY_URL = "https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do"
+
+CURRENCY_NAME_TO_CODE = {
+    "美元": "USD",
+    "欧元": "EUR",
+    "日元": "JPY",
+    "港元": "HKD",
+    "英镑": "GBP",
+    "澳元": "AUD",
+    "新西兰元": "NZD",
+    "新加坡元": "SGD",
+    "瑞士法郎": "CHF",
+    "加元": "CAD",
+    "澳门元": "MOP",
+    "林吉特": "MYR",
+    "卢布": "RUB",
+    "兰特": "ZAR",
+    "韩元": "KRW",
+    "迪拉姆": "AED",
+    "里亚尔": "SAR",
+    "福林": "HUF",
+    "兹罗提": "PLN",
+    "丹麦克朗": "DKK",
+    "瑞典克朗": "SEK",
+    "挪威克朗": "NOK",
+    "里拉": "TRY",
+    "比索": "MXN",
+    "泰铢": "THB",
+}
+
+INDIRECT_QUOTES = {
+    "MOP",
+    "MYR",
+    "RUB",
+    "ZAR",
+    "KRW",
+    "AED",
+    "SAR",
+    "HUF",
+    "PLN",
+    "DKK",
+    "SEK",
+    "NOK",
+    "TRY",
+    "MXN",
+    "THB",
+}
+
+TABLE_RE = re.compile(r'<table[^>]*id="InfoTable"[^>]*>(.*?)</table>', re.S | re.I)
+ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
+TAG_RE = re.compile(r"<[^>]+>")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="抓取人民币参考汇率，并输出人民币兑其他币种的一维表（CSV）。"
-    )
-    parser.add_argument(
-        "--range",
-        dest="date_range",
-        help="数据区间（推荐），格式 START:END，如 2025-01-01:2025-12-31",
-    )
-    parser.add_argument("--start-date", help="开始日期，格式 YYYY-MM-DD（与 --range 二选一）")
-    parser.add_argument("--end-date", help="结束日期，格式 YYYY-MM-DD（与 --range 二选一）")
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=365,
-        help="当未提供 --range 且未同时提供 start/end 时，默认回溯天数（默认 365）",
-    )
-    parser.add_argument("--url", default=DEFAULT_URL, help="汇率接口基础地址")
-    parser.add_argument("--timeout", type=float, default=8.0, help="单次HTTP请求超时秒数（默认8秒）")
-    parser.add_argument(
-        "--symbols",
-        default="",
-        help="可选：指定币种列表（逗号分隔，如 USD,EUR,JPY）；为空则使用接口返回的全部币种",
-    )
-    parser.add_argument("--sleep", type=float, default=0.0, help="逐日回退抓取时请求间隔秒数")
-    parser.add_argument(
-        "--output",
-        default="rmb_rates.csv",
-        help="输出CSV文件路径（列：date,from_currency,to_currency,rate）",
-    )
+    parser = argparse.ArgumentParser(description="抓取 SAFE 人民币汇率中间价，输出一维 CSV。")
+    parser.add_argument("--range", dest="date_range", help="数据区间，格式 START:END")
+    parser.add_argument("--start-date", help="开始日期 YYYY-MM-DD")
+    parser.add_argument("--end-date", help="结束日期 YYYY-MM-DD")
+    parser.add_argument("--days", type=int, default=365, help="未指定区间时默认回溯天数")
+    parser.add_argument("--url", default=DEFAULT_QUERY_URL, help="SAFE 查询接口地址")
+    parser.add_argument("--timeout", type=float, default=15.0, help="单次请求超时秒数")
+    parser.add_argument("--sleep", type=float, default=0.0, help="分段抓取间隔秒数")
+    parser.add_argument("--symbols", default="", help="币种代码列表，如 USD,EUR")
+    parser.add_argument("--output", default="rmb_rates.csv", help="输出 CSV 路径")
     return parser.parse_args()
 
 
@@ -75,109 +109,120 @@ def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
     return start, end
 
 
-def daterange(start: dt.date, end: dt.date) -> Iterable[dt.date]:
-    d = start
-    while d <= end:
-        yield d
-        d += dt.timedelta(days=1)
+def split_into_chunks(start: dt.date, end: dt.date, max_span_days: int = 92) -> List[Tuple[dt.date, dt.date]]:
+    chunks: List[Tuple[dt.date, dt.date]] = []
+    cur = start
+    while cur <= end:
+        seg_end = min(cur + dt.timedelta(days=max_span_days - 1), end)
+        chunks.append((cur, seg_end))
+        cur = seg_end + dt.timedelta(days=1)
+    return chunks
 
 
-def http_get_json(url: str, params: Dict[str, str], timeout: float) -> dict:
-    full_url = f"{url}?{urllib.parse.urlencode(params)}"
+def clean_text(cell_html: str) -> str:
+    text = TAG_RE.sub("", cell_html)
+    text = html.unescape(text)
+    return text.replace("\xa0", " ").replace("-->", "").strip()
+
+
+def http_post_html(url: str, payload: Dict[str, str], timeout: float) -> str:
+    data = urllib.parse.urlencode(payload).encode("utf-8")
     req = urllib.request.Request(
-        full_url,
+        url,
+        data=data,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; RMBFxCrawler/1.0)",
-            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": SOURCE_PAGE_URL,
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read()
-    return json.loads(data.decode("utf-8"))
+        body = resp.read()
+    return body.decode("utf-8", errors="ignore")
 
 
-def normalize_cny_to_targets(rates: object) -> Dict[str, float]:
-    """将接口返回归一化为: 1 CNY = x TARGET。"""
-    normalized: Dict[str, float] = {}
-    if not isinstance(rates, dict):
-        return normalized
+def parse_safe_table(html_text: str, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    wanted = set(symbols) if symbols else set(CURRENCY_NAME_TO_CODE.values())
+    out: Dict[str, Dict[str, float]] = {}
+    table_match = TABLE_RE.search(html_text)
+    if not table_match:
+        return out
 
-    for ccy, val in rates.items():
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
+    rows = ROW_RE.findall(table_match.group(1))
+    headers: List[str] = []
+    for row_html in rows:
+        cells = [clean_text(x) for x in CELL_RE.findall(row_html)]
+        if not cells:
             continue
-        if v <= 0:
+        if "日期" in cells and any(name in CURRENCY_NAME_TO_CODE for name in cells):
+            headers = cells
             continue
-        normalized[str(ccy).upper()] = v
-    return normalized
+        if not headers:
+            continue
+
+        day = cells[0]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            continue
+
+        daily = out.setdefault(day, {})
+        for idx, header in enumerate(headers[1:], start=1):
+            if idx >= len(cells):
+                continue
+            code = CURRENCY_NAME_TO_CODE.get(header)
+            if not code or code not in wanted:
+                continue
+            raw = cells[idx].replace(",", "")
+            if not raw or raw == "-":
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if value <= 0:
+                continue
+            if code in INDIRECT_QUOTES:
+                daily[code] = value / 100.0
+            else:
+                daily[code] = 100.0 / value
+    return out
 
 
-def fetch_range_rates(
-    base_url: str,
+def fetch_rates_with_auto_chunk(
+    url: str,
     start: dt.date,
     end: dt.date,
     symbols: List[str],
     timeout: float,
-) -> Dict[str, Dict[str, float]]:
-    """优先使用区间接口一次性抓取，返回 date -> {TARGET: rate(CNY->TARGET)}。"""
-    symbols_q = ",".join(symbols) if symbols else ""
-    day_to_rates: Dict[str, Dict[str, float]] = {}
-
-    url = f"{base_url.rstrip('/')}/{start:%Y-%m-%d}..{end:%Y-%m-%d}"
-    params = {"from": "CNY"}
-    if symbols_q:
-        params["to"] = symbols_q
-
-    payload = http_get_json(url, params, timeout=timeout)
-    rates_by_day = payload.get("rates", {}) if isinstance(payload, dict) else {}
-    if not isinstance(rates_by_day, dict):
-        return {}
-
-    for day, rates in rates_by_day.items():
-        normalized = normalize_cny_to_targets(rates)
-        if normalized:
-            day_to_rates[str(day)] = normalized
-    return day_to_rates
-
-
-def fetch_daily_rates(
-    base_url: str,
-    start: dt.date,
-    end: dt.date,
-    symbols: List[str],
     sleep_s: float,
-    timeout: float,
 ) -> Dict[str, Dict[str, float]]:
-    day_to_rates: Dict[str, Dict[str, float]] = {}
-    symbols_q = ",".join(symbols) if symbols else ""
+    chunks = split_into_chunks(start, end, max_span_days=92)
+    if len(chunks) > 1:
+        print(f"[INFO] 区间超过3个月，自动拆分为 {len(chunks)} 段抓取并拼接。")
 
-    for d in daterange(start, end):
-        day = d.strftime("%Y-%m-%d")
-        url = f"{base_url.rstrip('/')}/{day}"
-        params = {"from": "CNY"}
-        if symbols_q:
-            params["to"] = symbols_q
-
+    merged: Dict[str, Dict[str, float]] = {}
+    for idx, (seg_start, seg_end) in enumerate(chunks, start=1):
+        payload = {
+            "startDate": seg_start.strftime("%Y-%m-%d"),
+            "endDate": seg_end.strftime("%Y-%m-%d"),
+            "queryYN": "true",
+        }
         try:
-            payload = http_get_json(url, params, timeout=timeout)
-            normalized = normalize_cny_to_targets(payload.get("rates", {}))
-            if normalized:
-                day_to_rates[day] = normalized
+            html_text = http_post_html(url, payload, timeout=timeout)
+            piece = parse_safe_table(html_text, symbols)
+            merged.update(piece)
+            print(f"[INFO] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end}, 获取 {len(piece)} 个交易日")
         except Exception as exc:
-            print(f"[WARN] {day} 抓取失败: {exc}", file=sys.stderr)
-
+            print(f"[WARN] 分段 {seg_start} ~ {seg_end} 抓取失败: {exc}", file=sys.stderr)
         time.sleep(max(sleep_s, 0.0))
 
-    return day_to_rates
+    return merged
 
 
 def build_rmb_rows(day_to_rates: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, str, float]]:
     rows: List[Tuple[str, str, str, float]] = []
     for day in sorted(day_to_rates.keys()):
-        rates = day_to_rates[day]
-        for ccy in sorted(rates.keys()):
-            rows.append((day, "CNY", ccy, rates[ccy]))
+        for ccy in sorted(day_to_rates[day].keys()):
+            rows.append((day, "CNY", ccy, day_to_rates[day][ccy]))
     return rows
 
 
@@ -185,8 +230,8 @@ def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["date", "from_currency", "to_currency", "rate"])
-        for date, src, dst, rate in rows:
-            w.writerow([date, src, dst, f"{rate:.10f}"])
+        for day, src, dst, rate in rows:
+            w.writerow([day, src, dst, f"{rate:.10f}"])
 
 
 def main() -> int:
@@ -203,20 +248,16 @@ def main() -> int:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
+    print(f"数据源页面: {SOURCE_PAGE_URL}")
     print(f"抓取区间: {start} ~ {end}")
-    try:
-        day_to_rates = fetch_range_rates(args.url, start, end, symbols, timeout=args.timeout)
-        print(f"已使用区间接口一次性抓取，共 {len(day_to_rates)} 天数据")
-    except Exception as exc:
-        print(f"[WARN] 区间接口抓取失败，回退逐日抓取: {exc}", file=sys.stderr)
-        day_to_rates = fetch_daily_rates(
-            args.url,
-            start,
-            end,
-            symbols,
-            args.sleep,
-            timeout=args.timeout,
-        )
+    day_to_rates = fetch_rates_with_auto_chunk(
+        url=args.url,
+        start=start,
+        end=end,
+        symbols=symbols,
+        timeout=args.timeout,
+        sleep_s=args.sleep,
+    )
 
     rows = build_rmb_rows(day_to_rates)
     write_rmb_csv(args.output, rows)
