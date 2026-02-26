@@ -71,10 +71,6 @@ TAG_RE = re.compile(r"<[^>]+>")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取 SAFE 人民币汇率中间价，输出一维 CSV。")
-    parser.add_argument("--range", dest="date_range", help="数据区间，格式 START:END")
-    parser.add_argument("--start-date", help="开始日期 YYYY-MM-DD")
-    parser.add_argument("--end-date", help="结束日期 YYYY-MM-DD")
-    parser.add_argument("--days", type=int, default=365, help="未指定区间时默认回溯天数")
     parser.add_argument("--url", default=DEFAULT_QUERY_URL, help="SAFE 查询接口地址")
     parser.add_argument("--timeout", type=float, default=15.0, help="单次请求超时秒数")
     parser.add_argument("--sleep", type=float, default=0.0, help="分段抓取间隔秒数")
@@ -87,26 +83,20 @@ def parse_date(date_str: str) -> dt.date:
     return dt.datetime.strptime(date_str, "%Y-%m-%d").date()
 
 
-def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
-    if args.date_range:
-        if args.start_date or args.end_date:
-            raise ValueError("使用 --range 时，不应再传 --start-date/--end-date")
-        if ":" not in args.date_range:
-            raise ValueError("--range 格式错误，应为 START:END")
-        start_s, end_s = [x.strip() for x in args.date_range.split(":", 1)]
-        return parse_date(start_s), parse_date(end_s)
-
-    if bool(args.start_date) ^ bool(args.end_date):
-        raise ValueError("--start-date 与 --end-date 需要同时提供")
-
-    if args.start_date and args.end_date:
-        return parse_date(args.start_date), parse_date(args.end_date)
-
-    if args.days < 1:
-        raise ValueError("--days 必须 >= 1")
-    end = dt.date.today()
-    start = end - dt.timedelta(days=args.days)
-    return start, end
+def prompt_date_window() -> Tuple[dt.date, dt.date]:
+    """前台交互输入起始日期和终止日期。"""
+    while True:
+        try:
+            start_s = input("请输入起始日期(YYYY-MM-DD): ").strip()
+            end_s = input("请输入终止日期(YYYY-MM-DD): ").strip()
+            start = parse_date(start_s)
+            end = parse_date(end_s)
+            if start > end:
+                print("[ERROR] 起始日期不能晚于终止日期，请重新输入。", file=sys.stderr)
+                continue
+            return start, end
+        except ValueError:
+            print("[ERROR] 日期格式错误，请按 YYYY-MM-DD 重新输入。", file=sys.stderr)
 
 
 def split_into_chunks(start: dt.date, end: dt.date, max_span_days: int = 92) -> List[Tuple[dt.date, dt.date]]:
@@ -236,16 +226,7 @@ def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
 
 def main() -> int:
     args = parse_args()
-    try:
-        start, end = resolve_date_window(args)
-    except ValueError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 1
-
-    if start > end:
-        print("[ERROR] start-date 不能晚于 end-date", file=sys.stderr)
-        return 1
-
+    start, end = prompt_date_window()
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     print(f"数据源页面: {SOURCE_PAGE_URL}")

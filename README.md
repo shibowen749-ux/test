@@ -8,11 +8,27 @@
 - 实际查询接口：`https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do`
 - 统一输出口径：`1 CNY = rate TARGET`
 
-## 日期区间规则
+## 日期输入方式（前台提示输入）
 
-- 支持 `--range START:END` 或 `--start-date + --end-date`。
-- 未指定时可用 `--days` 回溯。
-- 当起始日期与终止日期相差 **大于 3 个月** 时，脚本自动拆分分段抓取并拼接。
+运行脚本后，会在前台提示输入：
+
+- 起始日期：`YYYY-MM-DD`
+- 终止日期：`YYYY-MM-DD`
+
+当起始日期与终止日期相差 **大于 3 个月** 时，脚本会自动分段抓取并拼接。
+
+## 运行示例
+
+```bash
+python3 rmb_middle_rate_crawler.py --symbols USD,EUR,JPY --output rmb_rates.csv
+```
+
+随后按提示输入：
+
+```text
+请输入起始日期(YYYY-MM-DD): 2025-01-01
+请输入终止日期(YYYY-MM-DD): 2025-06-30
+```
 
 ## 输出格式
 
@@ -23,12 +39,6 @@
 - `to_currency`
 - `rate`（表示 `1 CNY = rate to_currency`）
 
-## 运行示例
-
-```bash
-python3 rmb_middle_rate_crawler.py --range 2025-01-01:2025-06-30 --symbols USD,EUR,JPY
-```
-
 ## 打包 EXE
 
 ```bash
@@ -37,12 +47,3 @@ python3 -m PyInstaller --clean --noconfirm --onefile --name rmb_middle_rate_craw
 ```
 
 产物路径：`dist/rmb_middle_rate_crawler.exe`
-
-## GitHub 发布 v1.0（手工步骤）
-
-```bash
-git tag -a v1.0 -m "v1.0"
-git push origin v1.0
-# 可选（已安装 gh 时）:
-# gh release create v1.0 dist/rmb_middle_rate_crawler.exe --title "v1.0" --notes "SAFE source + auto chunking"
-```
