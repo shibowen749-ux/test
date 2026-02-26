@@ -154,7 +154,7 @@ def parse_safe_table(html_text: str, symbols: List[str]) -> Dict[str, Dict[str, 
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
             continue
 
-        daily = out.setdefault(day, {})
+        daily: Dict[str, float] = {}
         for idx, header in enumerate(headers[1:], start=1):
             if idx >= len(cells):
                 continue
@@ -174,6 +174,8 @@ def parse_safe_table(html_text: str, symbols: List[str]) -> Dict[str, Dict[str, 
                 daily[code] = value / 100.0
             else:
                 daily[code] = 100.0 / value
+        if daily:
+            out[day] = daily
     return out
 
 
@@ -200,7 +202,14 @@ def fetch_rates_with_auto_chunk(
             html_text = http_post_html(url, payload, timeout=timeout)
             piece = parse_safe_table(html_text, symbols)
             merged.update(piece)
-            print(f"[INFO] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end}, 获取 {len(piece)} 个交易日")
+            if piece:
+                print(f"[INFO] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end}, 获取 {len(piece)} 个交易日")
+            else:
+                print(
+                    f"[WARN] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end} 未返回数据，"
+                    "可能是该日期区间无交易日数据或所选币种无匹配。",
+                    file=sys.stderr,
+                )
         except Exception as exc:
             print(f"[WARN] 分段 {seg_start} ~ {seg_end} 抓取失败: {exc}", file=sys.stderr)
         time.sleep(max(sleep_s, 0.0))
@@ -239,6 +248,16 @@ def main() -> int:
         timeout=args.timeout,
         sleep_s=args.sleep,
     )
+
+    if not day_to_rates:
+        print(
+            "[ERROR] 未抓取到任何数据。请检查：\n"
+            "1) 输入日期是否为交易日区间；\n"
+            "2) 币种筛选是否过窄（可先不传 --symbols）；\n"
+            "3) 网络是否可访问 SAFE 站点。",
+            file=sys.stderr,
+        )
+        return 2
 
     rows = build_rmb_rows(day_to_rates)
     write_rmb_csv(args.output, rows)
