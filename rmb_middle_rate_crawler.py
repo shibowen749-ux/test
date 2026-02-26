@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import html
+import os
 import re
 import sys
 import time
@@ -71,11 +72,35 @@ CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _load_tk():
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        return root, simpledialog, filedialog, messagebox
+    except Exception:
+        return None, None, None, None
+
+
 def default_output_path() -> str:
-    docs = Path.home() / "Documents"
-    if docs.exists() and docs.is_dir():
-        return str(docs / "rmb_rates.csv")
-    return str(Path.home() / "rmb_rates.csv")
+    """默认输出到“我的文档”路径。"""
+    home = Path.home()
+    candidates = []
+    if os.name == "nt":
+        userprofile = os.environ.get("USERPROFILE")
+        onedrive = os.environ.get("OneDrive")
+        if userprofile:
+            candidates.append(Path(userprofile) / "Documents")
+        if onedrive:
+            candidates.append(Path(onedrive) / "Documents")
+    candidates.append(home / "Documents")
+    for p in candidates:
+        if p.exists() and p.is_dir():
+            return str(p / "rmb_rates.csv")
+    return str(home / "Documents" / "rmb_rates.csv")
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="币种代码列表，如 USD,EUR；默认空表示抓取 SAFE 源内全部币别",
     )
-    parser.add_argument("--output", default=default_output_path(), help="输出 CSV 路径")
+    parser.add_argument("--output", default="", help="输出 CSV 路径；为空时将弹窗选择保存位置")
     parser.add_argument("--start-date", default="", help="可选：开始日期 YYYY-MM-DD")
     parser.add_argument("--end-date", default="", help="可选：结束日期 YYYY-MM-DD")
     return parser.parse_args()
@@ -114,31 +139,30 @@ def prompt_date_window_cli() -> Tuple[dt.date, dt.date]:
 
 
 def prompt_date_window_gui() -> Tuple[dt.date, dt.date] | None:
-    """双击 .py 时优先使用图形输入框；若失败则返回 None 由 CLI 回退。"""
+    root, simpledialog, _, messagebox = _load_tk()
+    if not root:
+        return None
     try:
-        import tkinter as tk
-        from tkinter import simpledialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
         start_s = simpledialog.askstring("人民币汇率抓取", "请输入起始日期(YYYY-MM-DD):", parent=root)
         if not start_s:
-            root.destroy()
             return None
         end_s = simpledialog.askstring("人民币汇率抓取", "请输入终止日期(YYYY-MM-DD):", parent=root)
         if not end_s:
-            root.destroy()
             return None
-        root.destroy()
 
         start = parse_date(start_s.strip())
         end = parse_date(end_s.strip())
         if start > end:
+            if messagebox:
+                messagebox.showerror("日期错误", "起始日期不能晚于终止日期。")
             return None
         return start, end
-    except Exception:
+    except Exception as exc:
+        if messagebox:
+            messagebox.showerror("输入错误", f"日期输入无效：{exc}")
         return None
+    finally:
+        root.destroy()
 
 
 def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
@@ -149,11 +173,35 @@ def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
             raise ValueError("开始日期不能晚于结束日期")
         return start, end
 
-    # 无命令行日期参数时：先 GUI，再回退命令行交互
     picked = prompt_date_window_gui()
     if picked:
         return picked
     return prompt_date_window_cli()
+
+
+def resolve_output_path(args: argparse.Namespace) -> str:
+    if args.output:
+        return args.output
+
+    default_path = default_output_path()
+    root, _, filedialog, _ = _load_tk()
+    if root and filedialog:
+        try:
+            chosen = filedialog.asksaveasfilename(
+                parent=root,
+                title="选择汇率输出文件位置",
+                defaultextension=".csv",
+                initialfile="rmb_rates.csv",
+                initialdir=str(Path(default_path).parent),
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            )
+            if chosen:
+                return chosen
+        finally:
+            root.destroy()
+
+    # 回退：无 GUI 时默认“我的文档”
+    return default_path
 
 
 def split_into_chunks(start: dt.date, end: dt.date, max_span_days: int = 92) -> List[Tuple[dt.date, dt.date]]:
@@ -292,14 +340,30 @@ def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
             w.writerow([day, src, dst, f"{rate:.10f}"])
 
 
+def notify_gui(title: str, message: str, is_error: bool = False) -> None:
+    root, _, _, messagebox = _load_tk()
+    if not root or not messagebox:
+        return
+    try:
+        if is_error:
+            messagebox.showerror(title, message, parent=root)
+        else:
+            messagebox.showinfo(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
 def main() -> int:
     args = parse_args()
     try:
         start, end = resolve_date_window(args)
     except ValueError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
+        msg = f"[ERROR] {exc}"
+        print(msg, file=sys.stderr)
+        notify_gui("参数错误", str(exc), is_error=True)
         return 1
 
+    output_path = resolve_output_path(args)
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     print(f"数据源页面: {SOURCE_PAGE_URL}")
@@ -317,18 +381,21 @@ def main() -> int:
     )
 
     if not day_to_rates:
-        print(
-            "[ERROR] 未抓取到任何数据。请检查：\n"
+        err = (
+            "未抓取到任何数据。请检查：\n"
             "1) 输入日期是否为交易日区间；\n"
             "2) 币种筛选是否过窄（可先不传 --symbols）；\n"
-            "3) 网络是否可访问 SAFE 站点。",
-            file=sys.stderr,
+            "3) 网络是否可访问 SAFE 站点。"
         )
+        print(f"[ERROR] {err}", file=sys.stderr)
+        notify_gui("抓取失败", err, is_error=True)
         return 2
 
     rows = build_rmb_rows(day_to_rates)
-    write_rmb_csv(args.output, rows)
-    print(f"已写出人民币一维汇率表: {args.output} ({len(rows)} 行)")
+    write_rmb_csv(output_path, rows)
+    msg = f"已写出人民币一维汇率表: {output_path} ({len(rows)} 行)"
+    print(msg)
+    notify_gui("抓取完成", msg, is_error=False)
     return 0
 
 
