@@ -7,6 +7,7 @@
 - 来源页面：`https://www.safe.gov.cn/safe/rmbhlzjj/index.html`
 - 实际查询接口：`https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do`
 - 统一输出口径：`1 CNY = rate TARGET`
+- 抓取逻辑：先访问来源页并发起一次查询会话，再按日期分段提交查询请求抓取表格数据（更贴近网站“先查询后返回数据”的流程）。
 
 ## 运行方式（Windows 下可直接双击 .py）
 

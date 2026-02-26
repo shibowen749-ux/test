@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import html
+import http.cookiejar
 import os
 import re
 import sys
@@ -70,6 +71,7 @@ TABLE_RE = re.compile(r'<table[^>]*id="InfoTable"[^>]*>(.*?)</table>', re.S | re
 ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
 CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
 TAG_RE = re.compile(r"<[^>]+>")
+NON_TEXT_RE = re.compile(r"[^\u4e00-\u9fa5A-Za-z]")
 
 
 def _load_tk():
@@ -220,7 +222,39 @@ def clean_text(cell_html: str) -> str:
     return text.replace("\xa0", " ").replace("-->", "").strip()
 
 
-def http_post_html(url: str, payload: Dict[str, str], timeout: float) -> str:
+def normalize_header_name(name: str) -> str:
+    return NON_TEXT_RE.sub("", name)
+
+
+def create_safe_opener() -> urllib.request.OpenerDirector:
+    jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def warmup_safe_query(opener: urllib.request.OpenerDirector, timeout: float, query_url: str) -> None:
+    req_page = urllib.request.Request(
+        SOURCE_PAGE_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RMBFxCrawler/1.0)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with opener.open(req_page, timeout=timeout):
+        pass
+
+    req_query = urllib.request.Request(
+        query_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RMBFxCrawler/1.0)",
+            "Referer": SOURCE_PAGE_URL,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with opener.open(req_query, timeout=timeout):
+        pass
+
+
+def http_post_html(opener: urllib.request.OpenerDirector, url: str, payload: Dict[str, str], timeout: float) -> str:
     data = urllib.parse.urlencode(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -229,9 +263,11 @@ def http_post_html(url: str, payload: Dict[str, str], timeout: float) -> str:
             "User-Agent": "Mozilla/5.0 (compatible; RMBFxCrawler/1.0)",
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": SOURCE_PAGE_URL,
+            "Origin": "https://www.safe.gov.cn",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         body = resp.read()
     return body.decode("utf-8", errors="ignore")
 
@@ -249,8 +285,9 @@ def parse_safe_table(html_text: str, symbols: List[str]) -> Dict[str, Dict[str, 
         cells = [clean_text(x) for x in CELL_RE.findall(row_html)]
         if not cells:
             continue
-        if "日期" in cells and any(name in CURRENCY_NAME_TO_CODE for name in cells):
-            headers = cells
+        normalized_cells = [normalize_header_name(x) for x in cells]
+        if "日期" in normalized_cells and any(name in CURRENCY_NAME_TO_CODE for name in normalized_cells):
+            headers = normalized_cells
             continue
         if not headers:
             continue
@@ -296,6 +333,12 @@ def fetch_rates_with_auto_chunk(
     if len(chunks) > 1:
         print(f"[INFO] 区间超过3个月，自动拆分为 {len(chunks)} 段抓取并拼接。")
 
+    opener = create_safe_opener()
+    try:
+        warmup_safe_query(opener, timeout=timeout, query_url=url)
+    except Exception as exc:
+        print(f"[WARN] 初始化查询会话失败，将直接尝试抓取: {exc}", file=sys.stderr)
+
     merged: Dict[str, Dict[str, float]] = {}
     for idx, (seg_start, seg_end) in enumerate(chunks, start=1):
         payload = {
@@ -304,7 +347,7 @@ def fetch_rates_with_auto_chunk(
             "queryYN": "true",
         }
         try:
-            html_text = http_post_html(url, payload, timeout=timeout)
+            html_text = http_post_html(opener, url, payload, timeout=timeout)
             piece = parse_safe_table(html_text, symbols)
             merged.update(piece)
             if piece:
@@ -316,7 +359,24 @@ def fetch_rates_with_auto_chunk(
                     file=sys.stderr,
                 )
         except Exception as exc:
-            print(f"[WARN] 分段 {seg_start} ~ {seg_end} 抓取失败: {exc}", file=sys.stderr)
+            print(f"[WARN] 分段 {seg_start} ~ {seg_end} 抓取失败，尝试重建会话后重试: {exc}", file=sys.stderr)
+            try:
+                opener = create_safe_opener()
+                warmup_safe_query(opener, timeout=timeout, query_url=url)
+                html_text = http_post_html(opener, url, payload, timeout=timeout)
+                piece = parse_safe_table(html_text, symbols)
+                merged.update(piece)
+                if piece:
+                    print(
+                        f"[INFO] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end}, 重试成功，获取 {len(piece)} 个交易日"
+                    )
+                else:
+                    print(
+                        f"[WARN] 分段 {idx}/{len(chunks)}: {seg_start} ~ {seg_end} 重试后仍无数据。",
+                        file=sys.stderr,
+                    )
+            except Exception as retry_exc:
+                print(f"[WARN] 分段 {seg_start} ~ {seg_end} 重试失败: {retry_exc}", file=sys.stderr)
         time.sleep(max(sleep_s, 0.0))
 
     return merged
