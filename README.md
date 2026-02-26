@@ -8,36 +8,34 @@
 - 实际查询接口：`https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do`
 - 统一输出口径：`1 CNY = rate TARGET`
 
-## 日期输入方式（前台提示输入）
+## 运行方式（可直接双击 .py）
 
-运行脚本后，会在前台提示输入：
+- 直接双击 `rmb_middle_rate_crawler.py` 运行时，会弹出输入框让你填写：
+  - 起始日期（YYYY-MM-DD）
+  - 终止日期（YYYY-MM-DD）
+- 如果图形输入不可用，会自动回退到终端输入提示。
 
-- 起始日期：`YYYY-MM-DD`
-- 终止日期：`YYYY-MM-DD`
+> 当起始日期与终止日期相差 **大于 3 个月** 时，脚本会自动分段抓取并拼接。
 
-当起始日期与终止日期相差 **大于 3 个月** 时，脚本会自动分段抓取并拼接。
+## 币别说明
 
-## 运行示例
+- 默认不传 `--symbols` 时，会抓取 SAFE 源中**全部币别**。
+- 若只想抓取部分币别，可选：`--symbols USD,EUR,JPY`。
+
+## 输出位置（默认）
+
+- 默认输出文件：`我的文档/rmb_rates.csv`（即 `~/Documents/rmb_rates.csv`）
+- 可通过 `--output` 自定义路径。
+
+## 命令行运行示例（可选）
 
 ```bash
-python3 rmb_middle_rate_crawler.py --symbols USD,EUR,JPY --output rmb_rates.csv
+python3 rmb_middle_rate_crawler.py --start-date 2025-01-01 --end-date 2025-06-30
 ```
 
-随后按提示输入：
-
-```text
-请输入起始日期(YYYY-MM-DD): 2025-01-01
-请输入终止日期(YYYY-MM-DD): 2025-06-30
+```bash
+python3 rmb_middle_rate_crawler.py --start-date 2025-01-01 --end-date 2025-06-30 --symbols USD,EUR --output ./rmb_rates.csv
 ```
-
-## 输出格式
-
-输出文件默认为 `rmb_rates.csv`，列为：
-
-- `date`
-- `from_currency`（固定为 `CNY`）
-- `to_currency`
-- `rate`（表示 `1 CNY = rate to_currency`）
 
 ## 打包 EXE
 

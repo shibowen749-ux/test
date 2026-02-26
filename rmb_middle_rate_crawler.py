@@ -12,11 +12,13 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 SOURCE_PAGE_URL = "https://www.safe.gov.cn/safe/rmbhlzjj/index.html"
 DEFAULT_QUERY_URL = "https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do"
 
+# SAFE 页面币别（覆盖当前页面全部币别）
 CURRENCY_NAME_TO_CODE = {
     "美元": "USD",
     "欧元": "EUR",
@@ -69,13 +71,26 @@ CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+def default_output_path() -> str:
+    docs = Path.home() / "Documents"
+    if docs.exists() and docs.is_dir():
+        return str(docs / "rmb_rates.csv")
+    return str(Path.home() / "rmb_rates.csv")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取 SAFE 人民币汇率中间价，输出一维 CSV。")
     parser.add_argument("--url", default=DEFAULT_QUERY_URL, help="SAFE 查询接口地址")
     parser.add_argument("--timeout", type=float, default=15.0, help="单次请求超时秒数")
     parser.add_argument("--sleep", type=float, default=0.0, help="分段抓取间隔秒数")
-    parser.add_argument("--symbols", default="", help="币种代码列表，如 USD,EUR")
-    parser.add_argument("--output", default="rmb_rates.csv", help="输出 CSV 路径")
+    parser.add_argument(
+        "--symbols",
+        default="",
+        help="币种代码列表，如 USD,EUR；默认空表示抓取 SAFE 源内全部币别",
+    )
+    parser.add_argument("--output", default=default_output_path(), help="输出 CSV 路径")
+    parser.add_argument("--start-date", default="", help="可选：开始日期 YYYY-MM-DD")
+    parser.add_argument("--end-date", default="", help="可选：结束日期 YYYY-MM-DD")
     return parser.parse_args()
 
 
@@ -83,8 +98,7 @@ def parse_date(date_str: str) -> dt.date:
     return dt.datetime.strptime(date_str, "%Y-%m-%d").date()
 
 
-def prompt_date_window() -> Tuple[dt.date, dt.date]:
-    """前台交互输入起始日期和终止日期。"""
+def prompt_date_window_cli() -> Tuple[dt.date, dt.date]:
     while True:
         try:
             start_s = input("请输入起始日期(YYYY-MM-DD): ").strip()
@@ -97,6 +111,49 @@ def prompt_date_window() -> Tuple[dt.date, dt.date]:
             return start, end
         except ValueError:
             print("[ERROR] 日期格式错误，请按 YYYY-MM-DD 重新输入。", file=sys.stderr)
+
+
+def prompt_date_window_gui() -> Tuple[dt.date, dt.date] | None:
+    """双击 .py 时优先使用图形输入框；若失败则返回 None 由 CLI 回退。"""
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_s = simpledialog.askstring("人民币汇率抓取", "请输入起始日期(YYYY-MM-DD):", parent=root)
+        if not start_s:
+            root.destroy()
+            return None
+        end_s = simpledialog.askstring("人民币汇率抓取", "请输入终止日期(YYYY-MM-DD):", parent=root)
+        if not end_s:
+            root.destroy()
+            return None
+        root.destroy()
+
+        start = parse_date(start_s.strip())
+        end = parse_date(end_s.strip())
+        if start > end:
+            return None
+        return start, end
+    except Exception:
+        return None
+
+
+def resolve_date_window(args: argparse.Namespace) -> Tuple[dt.date, dt.date]:
+    if args.start_date and args.end_date:
+        start = parse_date(args.start_date)
+        end = parse_date(args.end_date)
+        if start > end:
+            raise ValueError("开始日期不能晚于结束日期")
+        return start, end
+
+    # 无命令行日期参数时：先 GUI，再回退命令行交互
+    picked = prompt_date_window_gui()
+    if picked:
+        return picked
+    return prompt_date_window_cli()
 
 
 def split_into_chunks(start: dt.date, end: dt.date, max_span_days: int = 92) -> List[Tuple[dt.date, dt.date]]:
@@ -226,7 +283,9 @@ def build_rmb_rows(day_to_rates: Dict[str, Dict[str, float]]) -> List[Tuple[str,
 
 
 def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["date", "from_currency", "to_currency", "rate"])
         for day, src, dst, rate in rows:
@@ -235,11 +294,19 @@ def write_rmb_csv(path: str, rows: List[Tuple[str, str, str, float]]) -> None:
 
 def main() -> int:
     args = parse_args()
-    start, end = prompt_date_window()
+    try:
+        start, end = resolve_date_window(args)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     print(f"数据源页面: {SOURCE_PAGE_URL}")
     print(f"抓取区间: {start} ~ {end}")
+    if not symbols:
+        print("[INFO] 未指定 --symbols，默认抓取 SAFE 源中的全部币别。")
+
     day_to_rates = fetch_rates_with_auto_chunk(
         url=args.url,
         start=start,
